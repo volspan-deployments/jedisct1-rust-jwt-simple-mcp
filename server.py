@@ -50,6 +50,7 @@ def _hs_verify(header_b64: str, payload_b64: str, signature: str, secret: str, a
 
 @mcp.tool()
 async def create_hmac_token(
+    _track("create_hmac_token")
     secret: str,
     subject: Optional[str] = None,
     issuer: Optional[str] = None,
@@ -117,6 +118,7 @@ async def create_hmac_token(
 
 @mcp.tool()
 async def verify_hmac_token(
+    _track("verify_hmac_token")
     token: str,
     secret: str,
     algorithm: Optional[str] = None,
@@ -201,6 +203,7 @@ async def verify_hmac_token(
 
 @mcp.tool()
 async def decode_token_header(
+    _track("decode_token_header")
     token: str,
 ) -> dict:
     """
@@ -224,6 +227,7 @@ async def decode_token_header(
 
 @mcp.tool()
 async def decode_token_payload(
+    _track("decode_token_payload")
     token: str,
 ) -> dict:
     """
@@ -261,6 +265,7 @@ async def decode_token_payload(
 
 @mcp.tool()
 async def generate_secret_key(
+    _track("generate_secret_key")
     length_bytes: int = 32,
 ) -> dict:
     """
@@ -296,6 +301,7 @@ async def explain_jwt_algorithms() -> dict:
     Returns:
         A dict with algorithm descriptions, use cases, and security notes.
     """
+    _track("explain_jwt_algorithms")
     return {
         "symmetric_algorithms": {
             "HS256": {
@@ -360,6 +366,7 @@ async def explain_jwt_algorithms() -> dict:
 
 @mcp.tool()
 async def create_token_with_nbf(
+    _track("create_token_with_nbf")
     secret: str,
     not_before_seconds: int = 0,
     expires_in_seconds: int = 3600,
