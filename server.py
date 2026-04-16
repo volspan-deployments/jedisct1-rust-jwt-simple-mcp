@@ -10,506 +10,424 @@ import base64
 import hmac
 import hashlib
 import time
-import struct
+import secrets
 from typing import Optional, Any
 
 mcp = FastMCP("jwt-simple")
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-def _base64url_encode(data: bytes) -> str:
-    """Encode bytes to base64url without padding."""
-    return base64.urlsafe_b64encode(data).rstrip(b'=').decode('utf-8')
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
-
-def _base64url_decode(data: str) -> bytes:
-    """Decode base64url string (with or without padding) to bytes."""
-    padding = 4 - len(data) % 4
+def _b64url_decode(s: str) -> bytes:
+    padding = 4 - len(s) % 4
     if padding != 4:
-        data += '=' * padding
-    return base64.urlsafe_b64decode(data)
+        s += "=" * padding
+    return base64.urlsafe_b64decode(s)
 
+def _hs_sign(header_b64: str, payload_b64: str, secret: str, algorithm: str) -> str:
+    msg = f"{header_b64}.{payload_b64}".encode()
+    if algorithm == "HS256":
+        sig = hmac.new(secret.encode(), msg, hashlib.sha256).digest()
+    elif algorithm == "HS384":
+        sig = hmac.new(secret.encode(), msg, hashlib.sha384).digest()
+    elif algorithm == "HS512":
+        sig = hmac.new(secret.encode(), msg, hashlib.sha512).digest()
+    else:
+        raise ValueError(f"Unsupported algorithm: {algorithm}")
+    return _b64url_encode(sig)
 
-def _get_hmac_algorithm(algorithm: str):
-    """Return the hashlib algorithm for the given JWT HMAC algorithm name."""
-    mapping = {
-        "HS256": hashlib.sha256,
-        "HS384": hashlib.sha384,
-        "HS512": hashlib.sha512,
-    }
-    return mapping.get(algorithm)
+def _hs_verify(header_b64: str, payload_b64: str, signature: str, secret: str, algorithm: str) -> bool:
+    expected = _hs_sign(header_b64, payload_b64, secret, algorithm)
+    return hmac.compare_digest(expected, signature)
 
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
 
 @mcp.tool()
-def create_hs256_token(
+async def create_hmac_token(
     secret: str,
     subject: Optional[str] = None,
     issuer: Optional[str] = None,
     audience: Optional[str] = None,
     expires_in_seconds: Optional[int] = 3600,
-    not_before_seconds: Optional[int] = None,
     custom_claims: Optional[str] = None,
-    algorithm: str = "HS256"
+    algorithm: str = "HS256",
+    key_id: Optional[str] = None,
 ) -> dict:
     """
-    Create a signed JWT token using HMAC symmetric algorithms (HS256, HS384, HS512).
-    This mirrors the jwt-simple Rust library's symmetric key token creation.
+    Create a signed JWT token using an HMAC algorithm (HS256, HS384, HS512).
 
     Args:
-        secret: The HMAC secret key (string). Will be UTF-8 encoded.
-        subject: Optional 'sub' claim.
-        issuer: Optional 'iss' claim.
-        audience: Optional 'aud' claim.
-        expires_in_seconds: Token expiry duration in seconds from now (default 3600). Set to None for no expiry.
-        not_before_seconds: Optional 'nbf' offset in seconds from now.
-        custom_claims: Optional JSON string of additional claims to embed (e.g. '{"role": "admin"}').
-        algorithm: JWT algorithm to use: HS256, HS384, or HS512 (default HS256).
+        secret: The secret key used to sign the token.
+        subject: The subject claim (sub).
+        issuer: The issuer claim (iss).
+        audience: The audience claim (aud).
+        expires_in_seconds: Token validity in seconds from now (default 3600). Use 0 for no expiry.
+        custom_claims: JSON string of additional claims to embed in the payload.
+        algorithm: One of HS256, HS384, HS512 (default HS256).
+        key_id: Optional key identifier (kid) to include in the header.
 
     Returns:
-        A dict with 'token' (the signed JWT string) and 'claims' (the payload as a dict).
+        A dict with 'token' (the JWT string) and 'header', 'payload' for inspection.
     """
     algorithm = algorithm.upper()
-    hash_fn = _get_hmac_algorithm(algorithm)
-    if hash_fn is None:
-        return {"error": f"Unsupported algorithm '{algorithm}'. Supported: HS256, HS384, HS512"}
+    if algorithm not in ("HS256", "HS384", "HS512"):
+        return {"error": f"Unsupported algorithm '{algorithm}'. Choose HS256, HS384, or HS512."}
 
     now = int(time.time())
 
-    header = {"alg": algorithm, "typ": "JWT"}
-    header_b64 = _base64url_encode(json.dumps(header, separators=(',', ':')).encode())
+    header: dict[str, Any] = {"alg": algorithm, "typ": "JWT"}
+    if key_id:
+        header["kid"] = key_id
 
-    payload: dict[str, Any] = {"iat": now}
+    payload: dict[str, Any] = {"iat": now, "jti": secrets.token_hex(16)}
     if subject:
         payload["sub"] = subject
     if issuer:
         payload["iss"] = issuer
     if audience:
         payload["aud"] = audience
-    if expires_in_seconds is not None:
+    if expires_in_seconds and expires_in_seconds > 0:
         payload["exp"] = now + expires_in_seconds
-    if not_before_seconds is not None:
-        payload["nbf"] = now + not_before_seconds
-
     if custom_claims:
         try:
             extra = json.loads(custom_claims)
-            if isinstance(extra, dict):
-                payload.update(extra)
-            else:
-                return {"error": "custom_claims must be a JSON object string"}
+            if not isinstance(extra, dict):
+                return {"error": "custom_claims must be a JSON object"}
+            payload.update(extra)
         except json.JSONDecodeError as e:
-            return {"error": f"Invalid custom_claims JSON: {str(e)}"}
+            return {"error": f"Invalid JSON in custom_claims: {e}"}
 
-    payload_b64 = _base64url_encode(json.dumps(payload, separators=(',', ':')).encode())
-    signing_input = f"{header_b64}.{payload_b64}".encode()
+    header_b64 = _b64url_encode(json.dumps(header, separators=(",", ":")).encode())
+    payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
 
-    sig = hmac.new(secret.encode('utf-8'), signing_input, hash_fn).digest()
-    sig_b64 = _base64url_encode(sig)
+    try:
+        signature = _hs_sign(header_b64, payload_b64, secret, algorithm)
+    except Exception as e:
+        return {"error": str(e)}
 
-    token = f"{header_b64}.{payload_b64}.{sig_b64}"
-    return {"token": token, "claims": payload, "algorithm": algorithm}
+    token = f"{header_b64}.{payload_b64}.{signature}"
+    return {"token": token, "header": header, "payload": payload}
 
 
 @mcp.tool()
-def verify_hs_token(
+async def verify_hmac_token(
     token: str,
     secret: str,
+    algorithm: Optional[str] = None,
     expected_issuer: Optional[str] = None,
     expected_audience: Optional[str] = None,
-    validate_expiry: bool = True
+    validate_expiry: bool = True,
 ) -> dict:
     """
-    Verify and decode a JWT token signed with an HMAC algorithm (HS256, HS384, HS512).
-    This mirrors the jwt-simple Rust library's symmetric key token verification.
+    Verify a JWT token signed with an HMAC algorithm (HS256, HS384, HS512).
 
     Args:
-        token: The JWT token string to verify.
-        secret: The HMAC secret key used to sign the token.
-        expected_issuer: If provided, validate that 'iss' matches this value.
-        expected_audience: If provided, validate that 'aud' matches this value.
-        validate_expiry: Whether to check 'exp' and 'nbf' claims (default True).
+        token: The JWT token string.
+        secret: The secret key to verify the signature.
+        algorithm: Expected algorithm. If not provided, uses the one in the token header.
+        expected_issuer: If set, validates that the 'iss' claim matches.
+        expected_audience: If set, validates that the 'aud' claim matches.
+        validate_expiry: Whether to validate the 'exp' claim (default True).
 
     Returns:
-        A dict with 'valid' (bool), 'claims' (dict if valid), and 'error' (string if invalid).
+        A dict with 'valid' (bool), 'payload' (decoded claims if valid), and 'error' on failure.
     """
-    parts = token.split('.')
+    parts = token.split(".")
     if len(parts) != 3:
-        return {"valid": False, "error": "Token must have 3 parts separated by dots"}
+        return {"valid": False, "error": "Token must have exactly 3 parts"}
 
-    header_b64, payload_b64, sig_b64 = parts
+    header_b64, payload_b64, signature = parts
 
     try:
-        header = json.loads(_base64url_decode(header_b64))
+        header = json.loads(_b64url_decode(header_b64))
     except Exception as e:
-        return {"valid": False, "error": f"Failed to decode header: {str(e)}"}
-
-    algorithm = header.get("alg", "").upper()
-    hash_fn = _get_hmac_algorithm(algorithm)
-    if hash_fn is None:
-        return {"valid": False, "error": f"Unsupported algorithm '{algorithm}' in token header"}
-
-    signing_input = f"{header_b64}.{payload_b64}".encode()
-    expected_sig = hmac.new(secret.encode('utf-8'), signing_input, hash_fn).digest()
+        return {"valid": False, "error": f"Failed to decode header: {e}"}
 
     try:
-        provided_sig = _base64url_decode(sig_b64)
-    except Exception:
-        return {"valid": False, "error": "Invalid signature encoding"}
+        payload = json.loads(_b64url_decode(payload_b64))
+    except Exception as e:
+        return {"valid": False, "error": f"Failed to decode payload: {e}"}
 
-    if not hmac.compare_digest(expected_sig, provided_sig):
+    token_alg = header.get("alg", "")
+    if algorithm:
+        if token_alg.upper() != algorithm.upper():
+            return {"valid": False, "error": f"Algorithm mismatch: token uses '{token_alg}', expected '{algorithm}'"}
+        alg_to_use = algorithm.upper()
+    else:
+        alg_to_use = token_alg.upper()
+
+    if alg_to_use not in ("HS256", "HS384", "HS512"):
+        return {"valid": False, "error": f"Unsupported algorithm '{alg_to_use}'"}
+
+    try:
+        sig_valid = _hs_verify(header_b64, payload_b64, signature, secret, alg_to_use)
+    except Exception as e:
+        return {"valid": False, "error": str(e)}
+
+    if not sig_valid:
         return {"valid": False, "error": "Signature verification failed"}
-
-    try:
-        claims = json.loads(_base64url_decode(payload_b64))
-    except Exception as e:
-        return {"valid": False, "error": f"Failed to decode payload: {str(e)}"}
 
     now = int(time.time())
 
     if validate_expiry:
-        exp = claims.get("exp")
+        exp = payload.get("exp")
         if exp is not None and now > exp:
-            return {"valid": False, "error": f"Token expired at {exp} (now: {now})"}
+            return {"valid": False, "error": "Token has expired", "payload": payload}
 
-        nbf = claims.get("nbf")
-        if nbf is not None and now < nbf:
-            return {"valid": False, "error": f"Token not yet valid (nbf: {nbf}, now: {now})"}
+    nbf = payload.get("nbf")
+    if nbf is not None and now < nbf:
+        return {"valid": False, "error": "Token not yet valid", "payload": payload}
 
     if expected_issuer:
-        if claims.get("iss") != expected_issuer:
-            return {"valid": False, "error": f"Issuer mismatch: expected '{expected_issuer}', got '{claims.get('iss')}'"}
+        if payload.get("iss") != expected_issuer:
+            return {"valid": False, "error": f"Issuer mismatch: got '{payload.get('iss')}', expected '{expected_issuer}'"}
 
     if expected_audience:
-        aud = claims.get("aud")
+        aud = payload.get("aud")
         if isinstance(aud, list):
             if expected_audience not in aud:
-                return {"valid": False, "error": f"Audience mismatch: '{expected_audience}' not in {aud}"}
+                return {"valid": False, "error": f"Audience mismatch"}
         elif aud != expected_audience:
-            return {"valid": False, "error": f"Audience mismatch: expected '{expected_audience}', got '{aud}'"}
+            return {"valid": False, "error": f"Audience mismatch: got '{aud}', expected '{expected_audience}'"}
 
-    return {"valid": True, "claims": claims, "algorithm": algorithm}
+    return {"valid": True, "payload": payload, "header": header}
 
 
 @mcp.tool()
-def decode_token_header(token: str) -> dict:
+async def decode_token_header(
+    token: str,
+) -> dict:
     """
-    Decode and inspect the JWT token header without verification.
-    Useful for peeking at the algorithm and key ID before deciding how to verify.
-    This mirrors jwt-simple's ability to peek at token metadata before verification.
+    Decode and inspect the JWT token header without verifying the signature.
 
     Args:
         token: The JWT token string.
 
     Returns:
-        A dict containing the decoded header fields.
+        A dict with the decoded 'header' fields (alg, typ, kid, etc.).
     """
-    parts = token.split('.')
+    parts = token.split(".")
     if len(parts) < 2:
-        return {"error": "Invalid token format: must have at least 2 parts"}
-
+        return {"error": "Invalid token format"}
     try:
-        header = json.loads(_base64url_decode(parts[0]))
+        header = json.loads(_b64url_decode(parts[0]))
         return {"header": header}
     except Exception as e:
-        return {"error": f"Failed to decode header: {str(e)}"}
+        return {"error": f"Failed to decode header: {e}"}
 
 
 @mcp.tool()
-def decode_token_claims_unverified(token: str) -> dict:
+async def decode_token_payload(
+    token: str,
+) -> dict:
     """
-    Decode and inspect JWT token claims WITHOUT verifying the signature.
-    WARNING: This does not verify the token's authenticity. Use only for inspection.
-    This mirrors jwt-simple's peeking capability for metadata inspection.
+    Decode and inspect the JWT token payload (claims) WITHOUT verifying the signature.
+    Use this only for inspection; always verify before trusting claims.
 
     Args:
         token: The JWT token string.
 
     Returns:
-        A dict containing 'header', 'claims', and a 'warning' about unverified status.
+        A dict with the decoded 'payload' claims and human-readable time fields.
     """
-    parts = token.split('.')
-    if len(parts) != 3:
-        return {"error": "Invalid token format: must have exactly 3 parts"}
-
+    parts = token.split(".")
+    if len(parts) < 2:
+        return {"error": "Invalid token format"}
     try:
-        header = json.loads(_base64url_decode(parts[0]))
+        payload = json.loads(_b64url_decode(parts[1]))
     except Exception as e:
-        return {"error": f"Failed to decode header: {str(e)}"}
+        return {"error": f"Failed to decode payload: {e}"}
 
-    try:
-        claims = json.loads(_base64url_decode(parts[1]))
-    except Exception as e:
-        return {"error": f"Failed to decode claims: {str(e)}"}
+    # Add human-readable timestamps
+    readable: dict[str, Any] = {}
+    for field in ("iat", "exp", "nbf"):
+        if field in payload:
+            readable[f"{field}_human"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(payload[field]))
 
     now = int(time.time())
-    exp = claims.get("exp")
-    nbf = claims.get("nbf")
-    iat = claims.get("iat")
+    if "exp" in payload:
+        remaining = payload["exp"] - now
+        readable["seconds_until_expiry"] = remaining
+        readable["is_expired"] = remaining < 0
 
-    time_info = {}
-    if exp is not None:
-        time_info["expires_at"] = exp
-        time_info["expired"] = now > exp
-        time_info["expires_in_seconds"] = exp - now
-    if nbf is not None:
-        time_info["not_before"] = nbf
-        time_info["active"] = now >= nbf
-    if iat is not None:
-        time_info["issued_at"] = iat
-        time_info["age_seconds"] = now - iat
+    return {"payload": payload, "time_info": readable}
 
+
+@mcp.tool()
+async def generate_secret_key(
+    length_bytes: int = 32,
+) -> dict:
+    """
+    Generate a cryptographically secure random secret key for use with HMAC JWT algorithms.
+
+    Args:
+        length_bytes: Number of random bytes (default 32 = 256 bits, suitable for HS256).
+                      Use 48 for HS384, 64 for HS512.
+
+    Returns:
+        A dict with the key in 'hex' and 'base64url' formats.
+    """
+    if length_bytes < 16:
+        return {"error": "length_bytes must be at least 16"}
+    if length_bytes > 512:
+        return {"error": "length_bytes must be at most 512"}
+
+    raw = secrets.token_bytes(length_bytes)
     return {
-        "warning": "UNVERIFIED - signature was NOT checked. Do not trust these claims for authentication.",
-        "header": header,
-        "claims": claims,
-        "time_info": time_info
+        "hex": raw.hex(),
+        "base64url": _b64url_encode(raw),
+        "length_bytes": length_bytes,
+        "length_bits": length_bytes * 8,
     }
 
 
 @mcp.tool()
-def explain_jwt_algorithms() -> dict:
+async def explain_jwt_algorithms() -> dict:
     """
-    Get an explanation of all JWT algorithms supported by the jwt-simple Rust library,
-    including their use cases, security properties, and implementation guidance.
+    Returns a reference table explaining all JWT algorithms supported by jwt-simple,
+    including HMAC symmetric and asymmetric (RSA, EC, EdDSA) algorithms.
 
     Returns:
-        A dict with algorithm categories and detailed descriptions.
+        A dict with algorithm descriptions, use cases, and security notes.
     """
     return {
-        "library": "jwt-simple (Rust crate)",
-        "crate_url": "https://crates.io/crates/jwt-simple",
-        "docs_url": "https://docs.rs/jwt-simple/",
-        "algorithm_categories": {
-            "symmetric_hmac": {
-                "description": "Symmetric algorithms using a shared secret. Both signing and verification use the same key.",
-                "use_case": "Best for single-service or microservice-internal tokens where you control both issuer and verifier.",
-                "algorithms": {
-                    "HS256": "HMAC-SHA-256. Most widely used. 256-bit security.",
-                    "HS384": "HMAC-SHA-384. Stronger variant.",
-                    "HS512": "HMAC-SHA-512. Strongest HMAC variant.",
-                    "BLAKE2B": "BLAKE2B-256. Fast, modern hash function."
-                },
-                "rust_example": "let key = HS256Key::generate();\nlet claims = Claims::create(Duration::from_hours(2));\nlet token = key.authenticate(claims)?;"
+        "symmetric_algorithms": {
+            "HS256": {
+                "description": "HMAC with SHA-256",
+                "key_type": "Shared secret",
+                "use_case": "Single-party or trusted-party token issuance and verification",
+                "security": "Both issuer and verifier share the same key; verifiers can also create tokens",
+                "recommended_key_size": "32+ bytes",
             },
-            "asymmetric_rsa": {
-                "description": "Asymmetric RSA algorithms. Private key signs, public key verifies.",
-                "use_case": "Best when multiple services need to verify tokens but only one service should issue them.",
-                "algorithms": {
-                    "RS256": "RSA + PKCS#1v1.5 padding + SHA-256. Widely compatible.",
-                    "RS384": "RSA + PKCS#1v1.5 padding + SHA-384.",
-                    "RS512": "RSA + PKCS#1v1.5 padding + SHA-512.",
-                    "PS256": "RSA + PSS padding + SHA-256. More secure padding than RS256.",
-                    "PS384": "RSA + PSS padding + SHA-384.",
-                    "PS512": "RSA + PSS padding + SHA-512."
-                },
-                "rust_example": "let kp = RS256KeyPair::generate(2048)?;\nlet claims = Claims::create(Duration::from_hours(2));\nlet token = kp.sign(claims)?;\nlet pk = kp.public_key();\nlet verified = pk.verify_token::<NoCustomClaims>(&token, None)?;"
+            "HS384": {
+                "description": "HMAC with SHA-384",
+                "key_type": "Shared secret",
+                "use_case": "Higher security HMAC scenarios",
+                "security": "Same trust model as HS256",
+                "recommended_key_size": "48+ bytes",
             },
-            "asymmetric_ec": {
-                "description": "Asymmetric Elliptic Curve algorithms. Smaller keys than RSA, equivalent security.",
-                "use_case": "Modern replacement for RSA with better performance and smaller key sizes.",
-                "algorithms": {
-                    "ES256": "ECDSA on P-256 curve + SHA-256. Very widely deployed.",
-                    "ES384": "ECDSA on P-384 curve + SHA-384.",
-                    "ES256K": "ECDSA on secp256k1 curve (Bitcoin curve) + SHA-256."
-                },
-                "rust_example": "let kp = ES256KeyPair::generate();\nlet claims = Claims::create(Duration::from_hours(2));\nlet token = kp.sign(claims)?;"
+            "HS512": {
+                "description": "HMAC with SHA-512",
+                "key_type": "Shared secret",
+                "use_case": "Highest security HMAC scenarios",
+                "security": "Same trust model as HS256",
+                "recommended_key_size": "64+ bytes",
             },
-            "asymmetric_eddsa": {
-                "description": "Edwards-curve Digital Signature Algorithm. Fast, safe, modern.",
-                "use_case": "Best choice for new projects needing asymmetric JWT signing.",
-                "algorithms": {
-                    "EdDSA": "Ed25519 curve. Fast, secure, no side-channel vulnerabilities."
-                },
-                "rust_example": "let kp = Ed25519KeyPair::generate();\nlet claims = Claims::create(Duration::from_hours(2));\nlet token = kp.sign(claims)?;"
-            }
+            "BLAKE2B": {
+                "description": "BLAKE2B-256 MAC",
+                "key_type": "Shared secret",
+                "use_case": "Fast alternative to HMAC-SHA256",
+                "security": "Excellent performance on modern hardware",
+                "recommended_key_size": "32+ bytes",
+            },
         },
-        "claims_fields": {
+        "asymmetric_algorithms": {
+            "RS256": {"description": "RSA PKCS#1v1.5 + SHA-256", "key_size": "2048+ bits"},
+            "RS384": {"description": "RSA PKCS#1v1.5 + SHA-384", "key_size": "2048+ bits"},
+            "RS512": {"description": "RSA PKCS#1v1.5 + SHA-512", "key_size": "2048+ bits"},
+            "PS256": {"description": "RSA PSS + SHA-256", "key_size": "2048+ bits"},
+            "PS384": {"description": "RSA PSS + SHA-384", "key_size": "2048+ bits"},
+            "PS512": {"description": "RSA PSS + SHA-512", "key_size": "2048+ bits"},
+            "ES256": {"description": "ECDSA P-256 + SHA-256", "key_size": "256 bits"},
+            "ES384": {"description": "ECDSA P-384 + SHA-384", "key_size": "384 bits"},
+            "ES256K": {"description": "ECDSA secp256k1 + SHA-256", "key_size": "256 bits"},
+            "EdDSA": {"description": "Ed25519 Edwards-curve signatures", "key_size": "256 bits"},
+        },
+        "security_notes": [
+            "Never share private keys; only distribute public keys for asymmetric algorithms.",
+            "For HMAC algorithms, the secret must be kept confidential on ALL parties.",
+            "Always validate exp, nbf, iss, aud claims in production.",
+            "Use at least HS256 / RS256 / ES256; avoid 'none' algorithm tokens.",
+            "Prefer EdDSA or ES256 for new systems due to small key size and strong security.",
+        ],
+        "standard_claims": {
             "iss": "Issuer - who issued the token",
             "sub": "Subject - who the token is about",
             "aud": "Audience - who the token is intended for",
-            "exp": "Expiration Time - Unix timestamp after which token is invalid",
-            "nbf": "Not Before - Unix timestamp before which token is invalid",
-            "iat": "Issued At - Unix timestamp when token was issued",
-            "jti": "JWT ID - unique identifier for the token (replay attack prevention)"
+            "exp": "Expiration time (Unix timestamp)",
+            "nbf": "Not before time (Unix timestamp)",
+            "iat": "Issued at time (Unix timestamp)",
+            "jti": "JWT ID - unique identifier for the token",
         },
-        "security_recommendations": [
-            "Always validate expiry (exp claim) in production",
-            "Use short-lived tokens (minutes to hours, not days)",
-            "For new projects, prefer EdDSA (Ed25519) or ES256 over RSA",
-            "Use audience (aud) claims to prevent token reuse across services",
-            "Store secrets securely (environment variables, secret managers)",
-            "Never use the 'none' algorithm",
-            "jwt-simple explicitly rejects the 'none' algorithm"
-        ]
     }
 
 
 @mcp.tool()
-def generate_hmac_secret(algorithm: str = "HS256") -> dict:
-    """
-    Generate a cryptographically secure random secret key suitable for use with
-    HMAC JWT algorithms (HS256, HS384, HS512). The secret is returned as a
-    hex string and base64url string for easy storage.
-
-    Args:
-        algorithm: The HMAC algorithm to generate a key for: HS256, HS384, or HS512.
-
-    Returns:
-        A dict with the generated secret in multiple encodings and usage guidance.
-    """
-    import secrets as secrets_module
-
-    algorithm = algorithm.upper()
-    key_sizes = {
-        "HS256": 32,
-        "HS384": 48,
-        "HS512": 64,
-    }
-
-    key_size = key_sizes.get(algorithm)
-    if key_size is None:
-        return {"error": f"Unsupported algorithm '{algorithm}'. Supported: HS256, HS384, HS512"}
-
-    raw_bytes = secrets_module.token_bytes(key_size)
-
-    return {
-        "algorithm": algorithm,
-        "key_size_bytes": key_size,
-        "key_size_bits": key_size * 8,
-        "secret_hex": raw_bytes.hex(),
-        "secret_base64url": _base64url_encode(raw_bytes),
-        "secret_base64": base64.b64encode(raw_bytes).decode(),
-        "rust_usage": f"let key = HS256Key::from_bytes(&hex::decode(\"<secret_hex>\").unwrap());",
-        "warning": "Store this secret securely. Never commit it to version control. Use environment variables or a secrets manager."
-    }
-
-
-@mcp.tool()
-def create_token_with_jti(
+async def create_token_with_nbf(
     secret: str,
-    subject: Optional[str] = None,
+    not_before_seconds: int = 0,
     expires_in_seconds: int = 3600,
-    algorithm: str = "HS256"
+    subject: Optional[str] = None,
+    issuer: Optional[str] = None,
+    algorithm: str = "HS256",
+    custom_claims: Optional[str] = None,
 ) -> dict:
     """
-    Create a JWT token with a unique JWT ID (jti claim) for replay attack prevention.
-    This mirrors jwt-simple's Mitigations against replay attacks feature.
+    Create a JWT token with a 'not before' (nbf) claim, making it invalid before a future time.
+    Useful for issuing tokens that activate in the future (e.g., scheduled access).
 
     Args:
-        secret: The HMAC secret key.
-        subject: Optional 'sub' claim.
-        expires_in_seconds: Token expiry in seconds (default 3600).
-        algorithm: JWT algorithm: HS256, HS384, or HS512.
+        secret: The secret key for signing.
+        not_before_seconds: Seconds from now before which the token is invalid (default 0 = immediately valid).
+        expires_in_seconds: Token lifetime in seconds from now (default 3600).
+        subject: The subject claim (sub).
+        issuer: The issuer claim (iss).
+        algorithm: HS256, HS384, or HS512 (default HS256).
+        custom_claims: JSON string of additional claims.
 
     Returns:
-        A dict with 'token', 'jti' (the unique ID), and 'claims'.
+        A dict with 'token', 'header', 'payload', and activation/expiry times.
     """
-    import secrets as secrets_module
-
     algorithm = algorithm.upper()
-    hash_fn = _get_hmac_algorithm(algorithm)
-    if hash_fn is None:
-        return {"error": f"Unsupported algorithm '{algorithm}'. Supported: HS256, HS384, HS512"}
+    if algorithm not in ("HS256", "HS384", "HS512"):
+        return {"error": f"Unsupported algorithm '{algorithm}'"}
 
     now = int(time.time())
-    jti = secrets_module.token_hex(16)
+    nbf = now + not_before_seconds
+    exp = now + expires_in_seconds
 
-    header = {"alg": algorithm, "typ": "JWT"}
-    header_b64 = _base64url_encode(json.dumps(header, separators=(',', ':')).encode())
-
+    header: dict[str, Any] = {"alg": algorithm, "typ": "JWT"}
     payload: dict[str, Any] = {
         "iat": now,
-        "exp": now + expires_in_seconds,
-        "jti": jti
+        "nbf": nbf,
+        "exp": exp,
+        "jti": secrets.token_hex(16),
     }
     if subject:
         payload["sub"] = subject
+    if issuer:
+        payload["iss"] = issuer
+    if custom_claims:
+        try:
+            extra = json.loads(custom_claims)
+            if not isinstance(extra, dict):
+                return {"error": "custom_claims must be a JSON object"}
+            payload.update(extra)
+        except json.JSONDecodeError as e:
+            return {"error": f"Invalid JSON in custom_claims: {e}"}
 
-    payload_b64 = _base64url_encode(json.dumps(payload, separators=(',', ':')).encode())
-    signing_input = f"{header_b64}.{payload_b64}".encode()
-    sig = hmac.new(secret.encode('utf-8'), signing_input, hash_fn).digest()
-    sig_b64 = _base64url_encode(sig)
+    header_b64 = _b64url_encode(json.dumps(header, separators=(",", ":")).encode())
+    payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
 
-    token = f"{header_b64}.{payload_b64}.{sig_b64}"
+    try:
+        signature = _hs_sign(header_b64, payload_b64, secret, algorithm)
+    except Exception as e:
+        return {"error": str(e)}
+
+    token = f"{header_b64}.{payload_b64}.{signature}"
     return {
         "token": token,
-        "jti": jti,
-        "claims": payload,
-        "algorithm": algorithm,
-        "replay_protection_note": "Store the jti in a cache/database with the exp time. Reject any token whose jti you've seen before."
-    }
-
-
-@mcp.tool()
-def compare_token_algorithms() -> dict:
-    """
-    Get a comparison of JWT signing algorithms supported by jwt-simple to help
-    choose the right algorithm for your use case.
-
-    Returns:
-        A detailed comparison table and recommendations.
-    """
-    return {
-        "comparison_table": [
-            {
-                "algorithm": "HS256",
-                "type": "Symmetric",
-                "key_type": "Shared Secret",
-                "key_size": "256 bits",
-                "performance": "Fastest",
-                "security_level": "128-bit",
-                "compatibility": "Universal",
-                "best_for": "Single-service tokens, simple setups"
-            },
-            {
-                "algorithm": "HS512",
-                "type": "Symmetric",
-                "key_type": "Shared Secret",
-                "key_size": "512 bits",
-                "performance": "Fast",
-                "security_level": "256-bit",
-                "compatibility": "Universal",
-                "best_for": "High-security symmetric tokens"
-            },
-            {
-                "algorithm": "RS256",
-                "type": "Asymmetric",
-                "key_type": "RSA Key Pair",
-                "key_size": "2048-4096 bits",
-                "performance": "Slow (sign), Moderate (verify)",
-                "security_level": "112-128 bit",
-                "compatibility": "Universal (widely supported)",
-                "best_for": "Legacy compatibility, OAuth2/OIDC"
-            },
-            {
-                "algorithm": "ES256",
-                "type": "Asymmetric",
-                "key_type": "EC Key Pair (P-256)",
-                "key_size": "256 bits",
-                "performance": "Fast",
-                "security_level": "128-bit",
-                "compatibility": "Good (most modern systems)",
-                "best_for": "Modern multi-service architectures"
-            },
-            {
-                "algorithm": "EdDSA",
-                "type": "Asymmetric",
-                "key_type": "Ed25519 Key Pair",
-                "key_size": "256 bits",
-                "performance": "Fastest asymmetric",
-                "security_level": "128-bit",
-                "compatibility": "Growing (newer systems)",
-                "best_for": "New projects, best security properties"
-            }
-        ],
-        "decision_guide": {
-            "single_service": "Use HS256 or HS512",
-            "multiple_services_verify": "Use ES256 or EdDSA",
-            "legacy_oauth_oidc": "Use RS256",
-            "maximum_performance": "Use HS256 (symmetric) or EdDSA (asymmetric)",
-            "maximum_compatibility": "Use HS256 or RS256",
-            "new_greenfield_project": "Use EdDSA (Ed25519)"
-        },
-        "jwt_simple_rust_note": "The jwt-simple crate supports all these algorithms natively. Import with 'use jwt_simple::prelude::*;' to get access to all key types and claim builders."
+        "header": header,
+        "payload": payload,
+        "activates_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(nbf)),
+        "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(exp)),
+        "not_before_seconds": not_before_seconds,
     }
 
 
